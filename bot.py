@@ -3,7 +3,6 @@ from discord.ext import commands
 import unicodedata
 import json
 import logging
-import asyncio
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -13,22 +12,16 @@ logging.info('Bot is starting up...')
 with open('config.json', 'r') as f:
     config = json.load(f)
 
-# Ensure that banned_usernames is a list
-banned_usernames = config.get('banned_usernames', [])
-if not isinstance(banned_usernames, list):
-    banned_usernames = [banned_usernames]
-
-# Convert banned_usernames to a set
-banned_usernames_set = set(banned_usernames)
-
 intents = discord.Intents.all()
 intents.members = True
 
-bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
+bot = commands.Bot(command_prefix='/', intents=intents, help_command=None)
+
+# Load banned usernames from config
+banned_usernames = set(map(lambda u: {'type': 'exact', 'value': u} if isinstance(u, str) else u, config['banned_usernames']))
 
 def save_banned_usernames():
-    banned_usernames_list = list(banned_usernames_set)
-    config['banned_usernames'] = banned_usernames_list
+    config['banned_usernames'] = list(banned_usernames)
     with open('config.json', 'w') as f:
         json.dump(config, f)
 
@@ -45,20 +38,23 @@ async def on_ready():
 @bot.event
 async def on_member_join(member):
     username = normalize_username(member.name)
-    if username in banned_usernames_set:
+    if any((username == ban['value'] if ban['type'] == 'exact' else ban['value'] in username)
+           for ban in banned_usernames):
         await member.ban(reason='Banned username')
 
 @bot.event
 async def on_member_update(before, after):
     old_name = normalize_username(before.name)
     new_name = normalize_username(after.name)
-    if old_name != new_name and new_name in banned_usernames_set:
+    if old_name != new_name and any((new_name == ban['value'] if ban['type'] == 'exact' else ban['value'] in new_name)
+                                    for ban in banned_usernames):
         await after.ban(reason='Banned username')
 
 @bot.event
 async def on_member_chunk(guild, members):
     for member in members:
-        if normalize_username(member.name) in banned_usernames_set:
+        if any((normalize_username(member.name) == ban['value'] if ban['type'] == 'exact' else ban['value'] in normalize_username(member.name))
+               for ban in banned_usernames):
             await member.ban(reason='Banned username')
 
 def is_admin():
@@ -69,58 +65,52 @@ def is_admin():
 
 @bot.command()
 @is_admin()
-async def ban_username(ctx, username: str):
-    global banned_usernames_set
+async def ban_username(ctx, username: str, match_type: str = 'exact'):
+    global banned_usernames
     normalized_username = normalize_username(username)
-    banned_usernames_set.add(normalized_username)
+    if match_type == 'exact':
+        banned_usernames.add({'type': 'exact', 'value': normalized_username})
+    elif match_type == 'contains':
+        banned_usernames.add({'type': 'contains', 'value': normalized_username})
+    else:
+        await ctx.send(f'Invalid match_type. Must be "exact" or "contains".')
+        return
     save_banned_usernames()
     await ctx.send(f'Username {username} has been added to the banned list.')
 
 @bot.command()
 @is_admin()
 async def unban_username(ctx, username: str):
-    global banned_usernames_set
     logging.info(f'unban_username command invoked by {ctx.author} with argument {username}')
     normalized_username = normalize_username(username)
-    if normalized_username in banned_usernames_set:
-        banned_usernames_set.remove(normalized_username)
-        save_banned_usernames()
-        await ctx.send(f'Username {username} has been removed from the banned list.')
-    else:
-        await ctx.send(f'Username {username} is not in the banned list.')
+    for ban in banned_usernames.copy():
+        if ban['value'] == normalized_username:
+            banned_usernames.remove(ban)
+    save_banned_usernames()
+    await ctx.send(f'Username {username} has been removed from the banned list.')
 
 @bot.command()
 @is_admin()
-async def sweep(ctx, *, option=None):
+async def sweep(ctx, exclude_roles: str = 'no'):
     report_channel_id = int(config["report_channel"])
     report_channel = bot.get_channel(report_channel_id)
     if not report_channel:
         await ctx.send('Report channel not found.')
         return
+    exclude_roles = exclude_roles.lower() == 'yes'
     for guild in bot.guilds:
-        members = guild.members
-        while members:
-            chunk = members[:1000]
-            members = members[1000:]
-            for member in chunk:
-                if option == 'no_roles':
-                    if member.roles == [guild.default_role]:
-                        for banned_username in banned_usernames_set:
-                            if banned_username in normalize_username(member.name):
-                                await member.ban(reason='Banned username')
-                                await report_channel.send(f'Banned {member.name} ({member.id})')
-                else:
-                    for banned_username in banned_usernames_set:
-                        if banned_username in normalize_username(member.name):
-                            await member.ban(reason='Banned username')
-                            await report_channel.send(f'Banned {member.name} ({member.id})')
-            await asyncio.sleep(1)
+        for member in guild.members:
+            if (not exclude_roles or all(role.is_default() for role in member.roles)) and any(
+                    (normalize_username(member.name) == ban['value'] if ban['type'] == 'exact' else ban['value'] in normalize_username(member.name))
+                    for ban in banned_usernames):
+                await member.ban(reason='Banned username')
+                await report_channel.send(f'Banned {member.name} ({member.id})')
     await ctx.send('Sweep complete.')
 
 @bot.command()
 async def list_banned_usernames(ctx):
-    if banned_usernames_set:
-        banned_list = '\n'.join(ban for ban in banned_usernames_set)
+    if banned_usernames:
+        banned_list = '\n'.join(map(lambda u: u['value'], banned_usernames))
         await ctx.send(f'Banned usernames:\n{banned_list}')
     else:
         await ctx.send('No banned usernames.')
@@ -129,27 +119,12 @@ async def list_banned_usernames(ctx):
 async def helpnb(ctx):
     help_text = """
     **Commands:**
-    `!ban_username <username>` - Adds a username to the banned list. *Admin only*
-    `!unban_username <username>` - Removes a username from the banned list. *Admin only*
-    `!list_banned_usernames` - Lists all banned usernames.
+    `/ban_username <username> [match_type]` - Adds a username to the banned list. The `match_type` can be "exact" or "contains". Defaults to "exact". *Admin only*
+    `/unban_username <username>` - Removes a username from the banned list. *Admin only*
+    `/sweep [exclude_roles]` - Runs a sweep of all users and bans those with banned usernames. The `exclude_roles` can be "yes" or "no". Defaults to "no". If "yes", users with roles will be excluded. *Admin only*
+    `/list_banned_usernames` - Lists all banned usernames.
     """
     await ctx.send(help_text)
-
-@ban_username.error
-async def ban_username_error(ctx, error):
-    if isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send('Please specify a username to ban.')
-    else:
-        logging.error(f'An unhandled exception occurred: {error}')  # Log the error for debugging
-        await ctx.send('An unexpected error occurred.')
-
-@unban_username.error
-async def unban_username_error(ctx, error):
-    if isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send('Please specify a username to unban.')
-    else:
-        logging.error(f'An unhandled exception occurred: {error}')  # Log the error for debugging
-        await ctx.send('An unexpected error occurred.')
 
 @bot.event
 async def on_command_error(ctx, error):
